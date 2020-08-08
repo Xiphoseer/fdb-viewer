@@ -1,3 +1,7 @@
-.table-list {
-    background-color: #000;
+.fdb-table-list {
+    background-color: @view_separators;
+}
+
+.fdb-table {
+    padding: 10px;
 }

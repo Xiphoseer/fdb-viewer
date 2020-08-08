@@ -12,6 +12,10 @@ assembly-data = { version = "0.1.2", path = "../assembly/modules/data" }
 version = "0.9.0"
 features = ["v3_16"]
 
+[dependencies.gdk]
+version = "0.13.0"
+features = ["v3_16"]
+
 [dependencies.gio]
 version = ""
 features = ["v2_44"]
@@ -20,3 +24,6 @@ features = ["v2_44"]
 version = ""
 features = ["v2_44"]
 
+[dependencies.rusqlite]
+version = "0.21.0"
+features = ["bundled"]
