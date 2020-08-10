@@ -15,6 +15,7 @@ use std::{
     ops::{Deref, Range},
     path::Path,
     rc::Rc,
+    time::Instant,
 };
 
 struct DB {
@@ -80,6 +81,7 @@ impl<'a> IntoIterator for SqliteRow<'a> {
 }
 
 fn try_export_db(path: &Path, db: Database) -> rusqlite::Result<()> {
+    let start = Instant::now();
     let conn = rusqlite::Connection::open(path)?;
 
     conn.execute("BEGIN", rusqlite::params![])?;
@@ -93,7 +95,7 @@ fn try_export_db(path: &Path, db: Database) -> rusqlite::Result<()> {
             if first {
                 first = false;
             } else {
-                write!(create_query, ",\n").unwrap();
+                writeln!(create_query, ",").unwrap();
                 write!(insert_query, ", ").unwrap();
             }
             let typ = match col.value_type() {
@@ -126,6 +128,12 @@ fn try_export_db(path: &Path, db: Database) -> rusqlite::Result<()> {
 
     conn.execute("COMMIT", rusqlite::params![])?;
 
+    let duration = start.elapsed();
+    println!(
+        "Export finished in {}.{}s",
+        duration.as_secs(),
+        duration.as_millis() % 1000
+    );
     Ok(())
 }
 
@@ -366,19 +374,6 @@ fn main() {
         let cidx_i32 = i32::try_from(col_index).unwrap();
         column.add_attribute(&cell, "text", cidx_i32);
         tree.append_column(&column);
-
-        /*<gtk::TreeViewColumn as gtk::TreeViewColumnExt>::set_cell_data_func(
-            &column,
-            &cell,
-            Some(Box::new(
-                move |_column: &gtk::TreeViewColumn,
-                      cell: &gtk::CellRenderer,
-                      _model: &gtk::TreeModel,
-                      _iter: &gtk::TreeIter| {
-                    cell.set_property("text", &"Foo").unwrap();
-                },
-            )),
-        );*/
     }
 
     let paging = Rc::new(RefCell::new(None));
@@ -386,10 +381,10 @@ fn main() {
 
     let set_paging = {
         let paging = paging.clone();
-        let button_box_paging = button_box_paging.clone();
+        //let button_box_paging = button_box_paging.clone();
         let button_previous = button_previous.clone();
         let button_next = button_next.clone();
-        let label_page = label_page.clone();
+        //let label_page = label_page.clone();
         move |new: Option<Paging>| {
             *paging.borrow_mut() = new;
             if let Some(p) = new {
@@ -410,7 +405,7 @@ fn main() {
         let set_paging = set_paging.clone();
         move |_button_next| {
             if let Some(page) = page.borrow().deref() {
-                let opt = paging.borrow().clone();
+                let opt = *paging.borrow();
                 if let Some(paging) = opt {
                     let b = database_memmap.borrow();
                     let mmap = &b.as_ref().unwrap().mmap[..];
@@ -436,11 +431,11 @@ fn main() {
     button_next.connect_clicked({
         let page = page.clone();
         let database_memmap = database_memmap.clone();
-        let paging = paging.clone();
+        //let paging = paging.clone();
         let set_paging = set_paging.clone();
         move |_button_next| {
             if let Some(page) = page.borrow().deref() {
-                let opt = paging.borrow().clone();
+                let opt = *paging.borrow();
                 if let Some(paging) = opt {
                     let b = database_memmap.borrow();
                     let mmap = &b.as_ref().unwrap().mmap[..];
@@ -464,10 +459,10 @@ fn main() {
     });
 
     listbox.connect_row_selected({
-        let table_content_view = table_content_view.clone();
+        //let table_content_view = table_content_view.clone();
         let database_memmap = database_memmap.clone();
-        let page = page.clone();
-        let set_paging = set_paging.clone();
+        //let page = page.clone();
+        //let set_paging = set_paging.clone();
         move |_list, obj| {
             if let Some(row) = obj {
                 table_content_view.set_model::<gtk::TreeStore>(None);
@@ -526,7 +521,7 @@ fn main() {
     });
 
     let load = {
-        let listbox = listbox.clone();
+        //let listbox = listbox.clone();
         let database_memmap = database_memmap.clone();
         let add_table_row = add_table_row.clone();
         let button_export = button_export.clone();
@@ -559,7 +554,6 @@ fn main() {
 
     button_open.connect_clicked({
         let window = window.clone();
-        let header = header.clone();
         move |_| {
             let file_chooser = gtk::FileChooserDialog::new(
                 Some("Foo"),
