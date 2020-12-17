@@ -1,15 +1,15 @@
 use assembly_data::fdb::{
-    align::{Database, Field, Row, Table},
-    core::ValueType,
+    common::ValueType,
+    core,
+    mem::{Database, Table},
+    sqlite,
 };
 use gio::prelude::*;
 use gtk::{prelude::*, TreeView};
 use memmap::Mmap;
-use rusqlite::{types::ToSqlOutput, ToSql};
 use std::{
     cell::RefCell,
     convert::TryFrom,
-    fmt::Write,
     fs::File,
     io,
     ops::{Deref, Range},
@@ -39,134 +39,13 @@ fn try_load_file(path: &Path) -> io::Result<DB> {
     Ok(DB { mmap })
 }
 
-pub struct SqliteVal<'a>(Field<'a>);
-
-impl<'a> ToSql for SqliteVal<'a> {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        use rusqlite::types::Value;
-        let r = match self.0 {
-            Field::Nothing => Value::Null,
-            Field::Integer(i) => Value::Integer(i.into()),
-            Field::Float(f) => Value::Real(f.into()),
-            Field::Text(s) => Value::Text(s.decode().into_owned()),
-            Field::Boolean(b) => Value::Integer(if b { 1 } else { 0 }),
-            Field::BigInt(i) => Value::Integer(i),
-            Field::VarChar(b) => Value::Text(b.decode().into_owned()),
-        };
-        Ok(ToSqlOutput::Owned(r))
-    }
-}
-
-struct Iter<'a> {
-    inner: Box<dyn Iterator<Item = Field<'a>> + 'a>,
-}
-
-impl<'a> Iterator for Iter<'a> {
-    type Item = SqliteVal<'a>;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(SqliteVal)
-    }
-}
-
-struct SqliteRow<'a>(Row<'a>);
-
-impl<'a> IntoIterator for SqliteRow<'a> {
-    type IntoIter = Iter<'a>;
-    type Item = SqliteVal<'a>;
-    fn into_iter(self) -> Self::IntoIter {
-        Iter {
-            inner: Box::new(self.0.field_iter()),
-        }
-    }
-}
-
-fn try_export_db(path: &Path, db: Database) -> rusqlite::Result<()> {
-    let start = Instant::now();
-    let conn = rusqlite::Connection::open(path)?;
-
-    conn.execute("BEGIN", rusqlite::params![])?;
-
-    let tables = db.tables();
-    for table in tables.iter() {
-        let mut create_query = format!("CREATE TABLE IF NOT EXISTS \"{}\"\n(\n", table.name());
-        let mut insert_query = format!("INSERT INTO \"{}\" (", table.name());
-        let mut first = true;
-        for col in table.column_iter() {
-            if first {
-                first = false;
-            } else {
-                writeln!(create_query, ",").unwrap();
-                write!(insert_query, ", ").unwrap();
-            }
-            let typ = match col.value_type() {
-                ValueType::Nothing => "NULL",
-                ValueType::Integer => "INTEGER",
-                ValueType::Float => "REAL",
-                ValueType::Text => "TEXT",
-                ValueType::Boolean => "INTEGER",
-                ValueType::BigInt => "INTEGER",
-                ValueType::VarChar => "BLOB",
-                ValueType::Unknown(_) => panic!(),
-            };
-            write!(create_query, "    [{}] {}", col.name(), typ).unwrap();
-            write!(insert_query, "[{}]", col.name()).unwrap();
-        }
-        create_query.push_str(");");
-        insert_query.push_str(") VALUES (?1");
-        for i in 2..=table.column_count() {
-            write!(insert_query, ", ?{}", i).unwrap();
-        }
-        insert_query.push_str(");");
-        println!("{}", insert_query);
-        conn.execute(&create_query, rusqlite::params![])?;
-
-        let mut stmt = conn.prepare(&insert_query)?;
-        for row in table.row_iter() {
-            stmt.execute(SqliteRow(row))?;
-        }
-    }
-
-    conn.execute("COMMIT", rusqlite::params![])?;
-
-    let duration = start.elapsed();
-    println!(
-        "Export finished in {}.{}s",
-        duration.as_secs(),
-        duration.as_millis() % 1000
-    );
-    Ok(())
-}
-
-pub enum RefField {
-    Integer(i32),
-    Float(f32),
-    Text(String),
-    Boolean(bool),
-    BigInt(i64),
-    VarChar(String),
-}
-
-impl RefField {
-    fn from(field: Field) -> Option<Self> {
-        match field {
-            Field::Nothing => None,
-            Field::Integer(iv) => Some(RefField::Integer(iv)),
-            Field::Float(fv) => Some(RefField::Float(fv)),
-            Field::Text(tv) => Some(RefField::Text(tv.decode().into_owned())),
-            Field::Boolean(bv) => Some(RefField::Boolean(bv)),
-            Field::BigInt(iv) => Some(RefField::BigInt(iv)),
-            Field::VarChar(vv) => Some(RefField::VarChar(vv.decode().into_owned())),
-        }
-    }
-}
-
 fn display_table(
     table_content_store: &gtk::TreeStore,
     col_count: usize,
     table: Table,
     range: Range<usize>,
 ) -> usize {
-    let mut buffer: Vec<RefField> = Vec::with_capacity(col_count);
+    let mut buffer: Vec<core::Field> = Vec::with_capacity(col_count);
     let mut gtval: Vec<&'static dyn glib::ToValue> = Vec::with_capacity(col_count);
     let mut gtidx = Vec::with_capacity(col_count);
 
@@ -185,7 +64,8 @@ fn display_table(
         gtidx.clear();
 
         for (i, field) in row.field_iter().enumerate() {
-            if let Some(r) = RefField::from(field) {
+            let r = core::Field::from(field);
+            if !matches!(r, core::Field::Nothing) {
                 buffer.push(r);
                 let cidex_u32 = u32::try_from(i).unwrap();
                 gtidx.push(cidex_u32);
@@ -194,27 +74,28 @@ fn display_table(
 
         for f in &buffer {
             match f {
-                RefField::Integer(int_val) => {
+                core::Field::Nothing => {}
+                core::Field::Integer(int_val) => {
                     let v: &'static i32 = unsafe { std::mem::transmute(int_val) };
                     gtval.push(v);
                 }
-                RefField::Float(float_val) => {
+                core::Field::Float(float_val) => {
                     let v: &'static f32 = unsafe { std::mem::transmute(float_val) };
                     gtval.push(v);
                 }
-                RefField::Text(str_val) => {
+                core::Field::Text(str_val) => {
                     let v: &'static String = unsafe { std::mem::transmute(str_val) };
                     gtval.push(v);
                 }
-                RefField::Boolean(bool_val) => {
+                core::Field::Boolean(bool_val) => {
                     let v: &'static bool = unsafe { std::mem::transmute(bool_val) };
                     gtval.push(v);
                 }
-                RefField::BigInt(int_val) => {
+                core::Field::BigInt(int_val) => {
                     let v: &'static i64 = unsafe { std::mem::transmute(int_val) };
                     gtval.push(v);
                 }
-                RefField::VarChar(str_val) => {
+                core::Field::VarChar(str_val) => {
                     let v: &'static String = unsafe { std::mem::transmute(str_val) };
                     gtval.push(v);
                 }
@@ -224,6 +105,21 @@ fn display_table(
         count += 1;
     }
     count
+}
+
+fn try_export_db(path: &Path, db: Database) -> sqlite::Result<()> {
+    let start = Instant::now();
+    let mut conn = sqlite::Connection::open(path)?;
+
+    sqlite::try_export_db(&mut conn, db)?;
+
+    let duration = start.elapsed();
+    println!(
+        "Finished in {}.{}s",
+        duration.as_secs(),
+        duration.subsec_millis()
+    );
+    Ok(())
 }
 
 fn main() {
@@ -411,8 +307,8 @@ fn main() {
                     let mmap = &b.as_ref().unwrap().mmap[..];
                     let db: Database = Database::new(mmap);
 
-                    let tables = db.tables();
-                    let table = tables.by_name(page.name.as_str()).unwrap();
+                    let tables = db.tables().unwrap();
+                    let table = tables.by_name(page.name.as_str()).unwrap().unwrap();
 
                     let current = paging.current - 1;
                     let new_min = current * 1024;
@@ -441,8 +337,8 @@ fn main() {
                     let mmap = &b.as_ref().unwrap().mmap[..];
                     let db: Database = Database::new(mmap);
 
-                    let tables = db.tables();
-                    let table = tables.by_name(page.name.as_str()).unwrap();
+                    let tables = db.tables().unwrap();
+                    let table = tables.by_name(page.name.as_str()).unwrap().unwrap();
 
                     let current = paging.current + 1;
                     let new_min = current * 1024;
@@ -478,8 +374,8 @@ fn main() {
                 let mmap = &b.as_ref().unwrap().mmap[..];
                 let db: Database = Database::new(mmap);
 
-                let tables = db.tables();
-                let table = tables.by_name(name.as_str()).unwrap();
+                let tables = db.tables().unwrap();
+                let table = tables.by_name(name.as_str()).unwrap().unwrap();
 
                 let col_count = table.column_count();
                 let mut gtcol = Vec::with_capacity(col_count);
@@ -493,7 +389,6 @@ fn main() {
                         ValueType::Boolean => bool::static_type(),
                         ValueType::BigInt => i64::static_type(),
                         ValueType::VarChar => String::static_type(),
-                        ValueType::Unknown(k) => panic!("Column type unknown {}", k),
                     };
                     gtcol.push(typ);
                     append_text_column(&table_content_view, tcol.name().as_ref(), col_index);
@@ -541,8 +436,9 @@ fn main() {
             let mmap = &b.as_ref().unwrap().mmap[..];
             let db: Database = Database::new(mmap);
 
-            let tables = db.tables();
+            let tables = db.tables().unwrap();
             for table in tables.iter() {
+                let table = table.unwrap();
                 add_table_row(table);
             }
             listbox.show_all();
